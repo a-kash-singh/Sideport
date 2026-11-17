@@ -6,7 +6,7 @@ only through Rosetta. Sideport is a 1.4 MB SwiftUI app with no Rosetta and no El
 
 [Download for Mac](https://github.com/a-kash-singh/Sideport/releases/latest) |
 [Website](https://a-kash-singh.github.io/Sideport/) |
-`brew install --cask a-kash-singh/tap/sideport`
+[Homebrew](#install)
 
 ![Sideport showing photo thumbnails from an Android phone's camera folder on a Mac](docs/screenshot-thumbnails.png)
 
@@ -31,7 +31,8 @@ only through Rosetta. Sideport is a 1.4 MB SwiftUI app with no Rosetta and no El
 **Homebrew**
 
 ```sh
-brew install --cask a-kash-singh/tap/sideport
+brew tap a-kash-singh/tap && brew trust a-kash-singh/tap
+brew install --cask sideport
 ```
 
 **Manual:** download `Sideport-arm64.zip` from [Releases](https://github.com/a-kash-singh/Sideport/releases/latest)
