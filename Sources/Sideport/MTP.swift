@@ -141,6 +141,19 @@ final class MTPDevice: @unchecked Sendable {
         return out
     }
 
+    /// The small JPEG preview the phone keeps for photos and videos. nil when there is none.
+    func thumbnail(_ id: UInt32) -> Data? {
+        guard let dev else { return nil }
+        var data: UnsafeMutablePointer<UInt8>?
+        var size: UInt32 = 0
+        defer { free(data) }
+        guard LIBMTP_Get_Thumbnail(dev, id, &data, &size) == 0, let data, size > 0 else {
+            LIBMTP_Clear_Errorstack(dev)
+            return nil
+        }
+        return Data(bytes: data, count: Int(size))
+    }
+
     func download(_ id: UInt32, to url: URL, token: TransferToken) throws {
         let d = try handle()
         let r = LIBMTP_Get_File_To_File(d, id, url.path, progressCallback, Unmanaged.passUnretained(token).toOpaque())

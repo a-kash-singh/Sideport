@@ -3,6 +3,7 @@ import SwiftUI
 @main
 struct SideportApp: App {
     @State private var model = AppModel()
+    @AppStorage("viewMode") private var viewMode = ViewMode.list
 
     var body: some Scene {
         Window("Sideport", id: "main") {
@@ -18,7 +19,24 @@ struct SideportApp: App {
                     .keyboardShortcut("o")
                     .disabled(model.storage == nil)
             }
+            CommandGroup(after: .newItem) {
+                Divider()
+                Button("Import New Photos") { model.importNewPhotos() }
+                    .keyboardShortcut("i")
+                    .disabled(model.storage == nil || model.importing)
+                Button("Change Import Folder...") { model.pickImportFolder() }
+                Divider()
+                Button("Quick Look") { model.quickLook() }
+                    .keyboardShortcut("y")
+                    .disabled(model.selection.isEmpty)
+            }
             CommandGroup(after: .toolbar) {
+                Picker("View", selection: $viewMode) {
+                    Text("as List").tag(ViewMode.list).keyboardShortcut("1")
+                    Text("as Thumbnails").tag(ViewMode.grid).keyboardShortcut("2")
+                }
+                .pickerStyle(.inline)
+                Divider()
                 Button("Refresh") { Task { await model.reload() } }
                     .keyboardShortcut("r")
                 Toggle("Show Hidden Files", isOn: Bindable(model).showHidden)

@@ -1,4 +1,5 @@
 import SwiftUI
+import QuickLook
 import UniformTypeIdentifiers
 
 private let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
@@ -23,6 +24,11 @@ struct ContentView: View {
             } else {
                 Browser()
             }
+        }
+        .alert("Import finished", isPresented: Binding(get: { model.notice != nil }, set: { if !$0 { model.notice = nil } })) {
+            Button("OK") {}
+        } message: {
+            Text(model.notice ?? "")
         }
         .alert("Something went wrong", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
             Button("OK") {}
@@ -69,6 +75,12 @@ struct Sidebar: View {
                     }
                 }
                 Section("Shortcuts") {
+                    Button { model.importNewPhotos() } label: {
+                        Label("Import New Photos", systemImage: "photo.on.rectangle.angled")
+                    }
+                    .buttonStyle(.plain)
+                    .selectionDisabled()
+                    .disabled(model.importing)
                     ForEach(Shortcut.all) { s in
                         Button { Task { await model.jump(to: s.paths) } } label: {
                             Label(s.title, systemImage: s.icon)
@@ -177,9 +189,11 @@ struct ConnectView: View {
 
 // MARK: - Browser
 
+enum ViewMode: String { case list, grid }
+
 struct Browser: View {
     @Environment(AppModel.self) private var model
-    @State private var selection = Set<Item.ID>()
+    @AppStorage("viewMode") private var viewMode = ViewMode.list
     @State private var sortOrder = [KeyPathComparator(\Item.name, comparator: .localizedStandard)]
     @State private var dropTargeted = false
     @State private var prompt: NamePrompt?
@@ -192,52 +206,12 @@ struct Browser: View {
 
     var body: some View {
         @Bindable var model = model
-        Table(of: Item.self, selection: $selection, sortOrder: $sortOrder) {
-            TableColumn("Name", value: \.name, comparator: .localizedStandard) { item in
-                HStack(spacing: 8) {
-                    Image(nsImage: Icons.icon(for: item)).resizable().frame(width: 18, height: 18)
-                    Text(item.name).lineLimit(1).truncationMode(.middle)
-                }
-            }
-            .width(min: 220, ideal: 360)
-            TableColumn("Size", value: \.size) { item in
-                Text(item.isFolder ? "--" : bytes(item.size))
-                    .foregroundStyle(.secondary).monospacedDigit()
-            }
-            .width(min: 70, ideal: 90)
-            TableColumn("Date Modified", value: \.modified) { item in
-                Text(item.modified.formatted(date: .abbreviated, time: .shortened))
-                    .foregroundStyle(.secondary)
-            }
-            .width(min: 120, ideal: 170)
-            TableColumn("Kind") { item in
-                Text(Icons.kind(for: item)).foregroundStyle(.secondary).lineLimit(1)
-            }
-            .width(min: 80, ideal: 120)
-        } rows: {
-            ForEach(rows) { item in
-                TableRow(item).itemProvider { model.itemProvider(for: item) }
-            }
+        Group {
+            if viewMode == .grid { grid } else { table }
         }
-        .contextMenu(forSelectionType: Item.ID.self) { ids in
-            if ids.count == 1, let item = model.items.first(where: { $0.id == ids.first }) {
-                Button(item.isFolder ? "Open" : "Open on Mac") { model.open(item) }
-                Button("Rename...") { prompt = NamePrompt(title: "Rename", name: item.name, item: item) }
-                Divider()
-            }
-            if !ids.isEmpty {
-                Button("Download to Downloads") { model.download(ids, to: downloads) }
-                Button("Download To...") { model.pickDownload(ids) }
-                Divider()
-                Button("Delete", role: .destructive) { confirmDelete = ids }
-            } else {
-                Button("New Folder...") { prompt = NamePrompt(title: "New Folder", name: "untitled folder") }
-                Button("Upload Files...") { model.pickUpload() }
-            }
-        } primaryAction: { ids in
-            if ids.count == 1, let item = model.items.first(where: { $0.id == ids.first }) { model.open(item) }
-        }
-        .onDeleteCommand { if !selection.isEmpty { confirmDelete = selection } }
+        .onKeyPress(.space) { model.quickLook(); return .handled }
+        .quickLookPreview($model.previewURL)
+        .onDeleteCommand { if !model.selection.isEmpty { confirmDelete = model.selection } }
         .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
             Task {
                 var urls: [URL] = []
@@ -265,7 +239,6 @@ struct Browser: View {
         .searchable(text: $model.filter, placement: .toolbar, prompt: "Filter")
         .navigationTitle(model.path.last?.name ?? model.currentStorage?.name ?? "Sideport")
         .toolbar { toolbar }
-        .onChange(of: model.path) { selection = [] }
         .alert(prompt?.title ?? "", isPresented: Binding(get: { prompt != nil }, set: { if !$0 { prompt = nil } })) {
             TextField("Name", text: Binding(get: { prompt?.name ?? "" }, set: { prompt?.name = $0 }))
             Button("Cancel", role: .cancel) {}
@@ -277,10 +250,95 @@ struct Browser: View {
         }
         .confirmationDialog(deleteTitle, isPresented: Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } })) {
             Button("Delete", role: .destructive) {
-                if let ids = confirmDelete { model.delete(ids); selection.subtract(ids) }
+                if let ids = confirmDelete { model.delete(ids); model.selection.subtract(ids) }
             }
         } message: {
             Text("This permanently deletes them from the phone. It cannot be undone.")
+        }
+    }
+
+    private var table: some View {
+        @Bindable var model = model
+        return Table(of: Item.self, selection: $model.selection, sortOrder: $sortOrder) {
+            TableColumn("Name", value: \.name, comparator: .localizedStandard) { item in
+                HStack(spacing: 8) {
+                    Image(nsImage: Icons.icon(for: item)).resizable().frame(width: 18, height: 18)
+                    Text(item.name).lineLimit(1).truncationMode(.middle)
+                }
+            }
+            .width(min: 220, ideal: 360)
+            TableColumn("Size", value: \.size) { item in
+                Text(item.isFolder ? "--" : bytes(item.size))
+                    .foregroundStyle(.secondary).monospacedDigit()
+            }
+            .width(min: 70, ideal: 90)
+            TableColumn("Date Modified", value: \.modified) { item in
+                Text(item.modified.formatted(date: .abbreviated, time: .shortened))
+                    .foregroundStyle(.secondary)
+            }
+            .width(min: 120, ideal: 170)
+            TableColumn("Kind") { item in
+                Text(Icons.kind(for: item)).foregroundStyle(.secondary).lineLimit(1)
+            }
+            .width(min: 80, ideal: 120)
+        } rows: {
+            ForEach(rows) { item in
+                TableRow(item).itemProvider { model.itemProvider(for: item) }
+            }
+        }
+        .contextMenu(forSelectionType: Item.ID.self) { ids in
+            menu(for: ids)
+        } primaryAction: { ids in
+            if ids.count == 1, let item = model.items.first(where: { $0.id == ids.first }) { model.open(item) }
+        }
+    }
+
+    private var grid: some View {
+        ScrollView {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 132), spacing: 10)], spacing: 14) {
+                ForEach(rows) { item in
+                    GridCell(item: item, selected: model.selection.contains(item.id))
+                        .onTapGesture(count: 2) { model.open(item) }
+                        .onTapGesture { select(item) }
+                        .onDrag { model.itemProvider(for: item) }
+                        .contextMenu { menu(for: model.selection.contains(item.id) ? model.selection : [item.id]) }
+                }
+            }
+            .padding(16)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { model.selection = [] }
+        .contextMenu { menu(for: []) }
+        .focusable()
+        .focusEffectDisabled()
+    }
+
+    private func select(_ item: Item) {
+        if NSEvent.modifierFlags.contains(.command) {
+            if model.selection.contains(item.id) { model.selection.remove(item.id) } else { model.selection.insert(item.id) }
+        } else {
+            model.selection = [item.id]
+        }
+    }
+
+    @ViewBuilder private func menu(for ids: Set<Item.ID>) -> some View {
+        if ids.count == 1, let item = model.items.first(where: { $0.id == ids.first }) {
+            Button(item.isFolder ? "Open" : "Open on Mac") { model.open(item) }
+            if !item.isFolder {
+                Button("Quick Look") { model.selection = [item.id]; model.quickLook() }
+            }
+            Button("Rename...") { prompt = NamePrompt(title: "Rename", name: item.name, item: item) }
+            Divider()
+        }
+        if !ids.isEmpty {
+            Button("Download to Downloads") { model.download(ids, to: downloads) }
+            Button("Download To...") { model.pickDownload(ids) }
+            Divider()
+            Button("Delete", role: .destructive) { confirmDelete = ids }
+        } else {
+            Button("New Folder...") { prompt = NamePrompt(title: "New Folder", name: "untitled folder") }
+            Button("Upload Files...") { model.pickUpload() }
+            Button("Import New Photos") { model.importNewPhotos() }
         }
     }
 
@@ -313,6 +371,15 @@ struct Browser: View {
                 .help("Enclosing folder")
         }
         ToolbarItemGroup(placement: .primaryAction) {
+            Picker("View", selection: $viewMode) {
+                Label("List", systemImage: "list.bullet").tag(ViewMode.list)
+                Label("Thumbnails", systemImage: "square.grid.2x2").tag(ViewMode.grid)
+            }
+            .pickerStyle(.segmented)
+            .help("Show as list or thumbnails")
+            Button { model.importNewPhotos() } label: { Label("Import New Photos", systemImage: "photo.on.rectangle.angled") }
+                .disabled(model.importing)
+                .help("Copy photos and videos you have not imported yet to \(model.importFolder.lastPathComponent)")
             Button { prompt = NamePrompt(title: "New Folder", name: "untitled folder") } label: {
                 Label("New Folder", systemImage: "folder.badge.plus")
             }
@@ -320,15 +387,62 @@ struct Browser: View {
             .help("New folder")
             Button { model.pickUpload() } label: { Label("Upload", systemImage: "square.and.arrow.up") }
                 .help("Copy files from your Mac to the phone")
-            Button { model.download(selection, to: downloads) } label: { Label("Download", systemImage: "square.and.arrow.down") }
-                .disabled(selection.isEmpty)
+            Button { model.download(model.selection, to: downloads) } label: { Label("Download", systemImage: "square.and.arrow.down") }
+                .disabled(model.selection.isEmpty)
                 .help("Copy selected items to Downloads")
-            Button { confirmDelete = selection } label: { Label("Delete", systemImage: "trash") }
-                .disabled(selection.isEmpty)
+            Button { confirmDelete = model.selection } label: { Label("Delete", systemImage: "trash") }
+                .disabled(model.selection.isEmpty)
                 .help("Delete selected items")
-            Button { Task { await model.reload() } } label: { Label("Refresh", systemImage: "arrow.clockwise") }
-                .help("Refresh")
         }
+    }
+}
+
+struct GridCell: View {
+    @Environment(AppModel.self) private var model
+    let item: Item
+    let selected: Bool
+    @State private var thumb: NSImage?
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Group {
+                if let thumb {
+                    Image(nsImage: thumb)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 108, height: 108)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .overlay(alignment: .bottomTrailing) {
+                            if Icons.type(for: item).conforms(to: .movie) {
+                                Image(systemName: "play.circle.fill")
+                                    .font(.title3)
+                                    .foregroundStyle(.white, .black.opacity(0.45))
+                                    .padding(5)
+                            }
+                        }
+                } else {
+                    Image(nsImage: Icons.icon(for: item))
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 76, height: 76)
+                }
+            }
+            .frame(width: 120, height: 120)
+            .background(RoundedRectangle(cornerRadius: 10).fill(selected ? Color.primary.opacity(0.12) : .clear))
+
+            Text(item.name)
+                .font(.caption)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .foregroundStyle(selected ? Color.white : Color.primary)
+                .background(RoundedRectangle(cornerRadius: 4).fill(selected ? Color.accentColor : .clear))
+        }
+        .frame(width: 132)
+        .help(item.name)
+        .contentShape(Rectangle())
+        .task(id: item.id) { thumb = await model.thumbnail(for: item) }
     }
 }
 
@@ -477,6 +591,11 @@ enum Icons {
         let i = NSWorkspace.shared.icon(for: t)
         cache[t.identifier] = i
         return i
+    }
+
+    static func hasThumbnail(_ item: Item) -> Bool {
+        let t = type(for: item)
+        return t.conforms(to: .image) || t.conforms(to: .movie)
     }
 
     static func kind(for item: Item) -> String { type(for: item).localizedDescription ?? "Document" }

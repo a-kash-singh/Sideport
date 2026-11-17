@@ -9,8 +9,11 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - run: brew install pkgconf
-      - run: scripts/package.sh
-      - run: gh release create "$GITHUB_REF_NAME" build/Sideport-arm64.zip --generate-notes
-        env:
+      - env:
           GH_TOKEN: ${{ github.token }}
+        run: |
+          # Skip when the release was already published from a local build.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then echo "release exists"; exit 0; fi
+          brew install pkgconf
+          scripts/package.sh
+          gh release create "$GITHUB_REF_NAME" build/Sideport-arm64.zip --generate-notes

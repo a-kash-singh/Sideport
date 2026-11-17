@@ -43,6 +43,19 @@ final class AppModel {
     var filter = ""
     var transfers: [Transfer] = []
     var errorMessage: String?
+    var notice: String?
+    var selection = Set<Item.ID>()
+    var previewURL: URL?
+    var importing = false
+    var importFolder: URL {
+        get { UserDefaults.standard.url(forKey: "importFolder") ?? Self.defaultImportFolder }
+        set { UserDefaults.standard.set(newValue, forKey: "importFolder") }
+    }
+    static let defaultImportFolder = FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask)[0]
+        .appending(path: "Android Import")
+
+    private let thumbs = NSCache<NSNumber, NSImage>()
+    private var noThumb = Set<UInt32>()
 
     let mtp = MTPDevice()
     private var started = false
@@ -126,6 +139,9 @@ final class AppModel {
         storage = nil
         path = []
         items = []
+        selection = []
+        thumbs.removeAllObjects()
+        noThumb = []
         releasedImageCapture = false
         status = .searching
     }
@@ -137,6 +153,7 @@ final class AppModel {
         storage = id
         path = []
         items = []
+        selection = []
         Task { await reload() }
     }
 
@@ -144,12 +161,12 @@ final class AppModel {
         if item.isFolder {
             path.append(item)
             items = []
+            selection = []
             filter = ""
             Task { await reload() }
         } else {
-            let dir = FileManager.default.temporaryDirectory.appending(path: "Sideport/\(UUID().uuidString)")
             schedule { [self] in
-                if let url = try? await fetch(item, into: dir) { NSWorkspace.shared.open(url) }
+                if let url = try? await previewCopy(of: item) { NSWorkspace.shared.open(url) }
             }
         }
     }
@@ -158,6 +175,7 @@ final class AppModel {
         guard depth < path.count else { return }
         path.removeSubrange(depth...)
         items = []
+        selection = []
         Task { await reload() }
     }
 
@@ -167,23 +185,127 @@ final class AppModel {
     func jump(to candidates: [[String]]) async {
         guard let s = storage else { return }
         for names in candidates {
-            var trail: [Item] = []
-            var parent = rootFolder
-            for name in names {
-                guard let kids = try? await mtp.run({ try $0.list(storage: s, parent: parent) }),
-                      let hit = kids.first(where: { $0.isFolder && $0.name.caseInsensitiveCompare(name) == .orderedSame })
-                else { trail = []; break }
-                trail.append(hit)
-                parent = hit.id
-            }
-            if !trail.isEmpty {
+            if let trail = await findFolder(names, storage: s) {
                 path = trail
+                selection = []
                 filter = ""
                 await reload()
                 return
             }
         }
         errorMessage = "That folder was not found on this device."
+    }
+
+    /// Resolves folder names from the storage root, case-insensitively. Returns the folder trail.
+    private func findFolder(_ names: [String], storage s: UInt32) async -> [Item]? {
+        var trail: [Item] = []
+        var parent = rootFolder
+        for name in names {
+            guard let kids = try? await mtp.run({ try $0.list(storage: s, parent: parent) }),
+                  let hit = kids.first(where: { $0.isFolder && $0.name.caseInsensitiveCompare(name) == .orderedSame })
+            else { return nil }
+            trail.append(hit)
+            parent = hit.id
+        }
+        return trail
+    }
+
+    // MARK: thumbnails, Quick Look
+
+    func thumbnail(for item: Item) async -> NSImage? {
+        if let i = thumbs.object(forKey: NSNumber(value: item.id)) { return i }
+        guard !noThumb.contains(item.id), Icons.hasThumbnail(item) else { return nil }
+        // Grid cells that scroll away cancel their task; skip their queued request.
+        let flag = TransferToken()
+        let data = await withTaskCancellationHandler {
+            try? await mtp.run { flag.cancelled ? nil : $0.thumbnail(item.id) }
+        } onCancel: {
+            flag.cancelled = true
+        }
+        guard let data, let image = NSImage(data: data) else {
+            if !flag.cancelled { noThumb.insert(item.id) }
+            return nil
+        }
+        thumbs.setObject(image, forKey: NSNumber(value: item.id))
+        return image
+    }
+
+    /// Quick Look the first selected file (downloads it to a cache first).
+    func quickLook() {
+        guard previewURL == nil,
+              let item = items.first(where: { selection.contains($0.id) && !$0.isFolder }) else {
+            previewURL = nil
+            return
+        }
+        schedule { [self] in previewURL = try? await previewCopy(of: item) }
+    }
+
+    /// Cached local copy used by Quick Look and "Open on Mac".
+    private func previewCopy(of item: Item) async throws -> URL {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "Sideport/Preview/\(item.storage)-\(item.id)")
+        let url = dir.appending(path: item.name)
+        if let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, UInt64(size) == item.size { return url }
+        try? FileManager.default.removeItem(at: dir)
+        return try await fetch(item, into: dir)
+    }
+
+    // MARK: import new photos
+
+    /// Copies photos and videos from DCIM and Pictures/Screenshots that were never imported before.
+    func importNewPhotos() {
+        guard let s = storage, !importing else { return }
+        importing = true
+        let dest = importFolder
+        schedule { [self] in
+            defer { importing = false }
+            let gen = generation
+            var found: [Item] = []
+            for names in [["DCIM"], ["Pictures", "Screenshots"]] {
+                if let folder = await findFolder(names, storage: s)?.last { await collectMedia(in: folder, into: &found) }
+            }
+            var ledger = ImportLedger.load()
+            let fresh = found.filter { !ledger.contains($0) && !Self.exists($0, in: dest) }
+            var copied = 0
+            for item in fresh {
+                guard gen == generation else { break }
+                do {
+                    _ = try await fetch(item, into: dest)
+                    ledger.insert(item)
+                    copied += 1
+                } catch {
+                    if gen != generation { break }
+                }
+            }
+            for item in found where Self.exists(item, in: dest) { ledger.insert(item) }
+            ledger.save()
+            notice = fresh.isEmpty
+                ? "No new photos or videos. Everything on the phone was already imported."
+                : "Imported \(copied) of \(fresh.count) new photos and videos to \(dest.path)."
+            if copied > 0 { NSWorkspace.shared.open(dest) }
+        }
+    }
+
+    private func collectMedia(in folder: Item, into out: inout [Item]) async {
+        guard let kids = try? await mtp.run({ try $0.list(storage: folder.storage, parent: folder.id) }) else { return }
+        for kid in kids where !kid.name.hasPrefix(".") {
+            if kid.isFolder { await collectMedia(in: kid, into: &out) }
+            else if Icons.hasThumbnail(kid) { out.append(kid) }
+        }
+    }
+
+    private static func exists(_ item: Item, in dir: URL) -> Bool {
+        let size = try? dir.appending(path: item.name).resourceValues(forKeys: [.fileSizeKey]).fileSize
+        return size.map { UInt64($0) == item.size } ?? false
+    }
+
+    func pickImportFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.directoryURL = importFolder
+        panel.prompt = "Use as Import Folder"
+        if panel.runModal() == .OK, let url = panel.url { importFolder = url }
     }
 
     func reload() async {
@@ -306,6 +428,8 @@ final class AppModel {
             let t = Transfer(name: item.name, kind: .download, total: item.size)
             try await perform(t) { try $0.download(item.id, to: dest, token: $1) }
             t.localURL = dest
+            // Keep the phone's date so Finder and Photos sort copies by when they were taken.
+            try? FileManager.default.setAttributes([.modificationDate: item.modified], ofItemAtPath: dest.path)
         }
         return dest
     }
@@ -343,6 +467,28 @@ final class AppModel {
             throw error
         }
     }
+}
+
+/// Remembers which phone files were imported (by name and size), so moving or deleting
+/// imported copies on the Mac does not bring them back on the next import.
+struct ImportLedger {
+    private static let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appending(path: "Sideport/imported.json")
+    private var keys: Set<String>
+
+    static func load() -> ImportLedger {
+        let keys = (try? JSONDecoder().decode(Set<String>.self, from: Data(contentsOf: url))) ?? []
+        return ImportLedger(keys: keys)
+    }
+
+    func save() {
+        try? FileManager.default.createDirectory(at: Self.url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? JSONEncoder().encode(keys).write(to: Self.url, options: .atomic)
+    }
+
+    func contains(_ item: Item) -> Bool { keys.contains(Self.key(item)) }
+    mutating func insert(_ item: Item) { keys.insert(Self.key(item)) }
+    private static func key(_ item: Item) -> String { "\(item.name)|\(item.size)" }
 }
 
 func uniqueName(_ name: String, taken: Set<String>) -> String {
